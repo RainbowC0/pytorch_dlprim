@@ -485,6 +485,12 @@ def test_all(device):
     print("Test where out")
     test_fwd([([4,3],2),([4,3],-1),([4,3],-1),([4,3],-1)],lambda c,x,y,o:torch.where(c.bool(),x,y,out=o),device)
 
+    print("Test index_select")
+    test_fwd([([3,4,4],-1),([5],4)],lambda x,i:x.index_select(1,i),device)
+    
+    print("Test index_add")
+    test_fwd([([3,4,4],-1),([5],4),([3,5,4],-1)],lambda x,i,s:x.index_add(1,i,s),device)
+
 
 def test_concat(dev):
     print("Test concat")

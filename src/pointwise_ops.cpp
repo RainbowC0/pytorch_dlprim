@@ -14,6 +14,7 @@
 #include <dlprim/core/activation.hpp>
 
 #include <iostream>
+#define STR(x) #x
 namespace ptdlprim {
 
 using namespace torch;
@@ -609,7 +610,7 @@ using c10::DeviceType;
     Tensor& compinf_out(const Tensor& self, Tensor& out, std::string const& op)
     {
         GUARD;
-        if (c10::isIntegralType(self.scalar_type(), true)) {
+        if (c10::isIntegralType(self.dtype().toScalarType(), true)) {
             out.fill_(false);
             sync_if_needed(out.device());
             return out;
@@ -657,6 +658,78 @@ using c10::DeviceType;
         if (!out.is_contiguous())
             out.copy_(out_c);
         sync_if_needed(self.device());
+        return out;
+    }
+
+    // {"schema": "aten::index_select.out(Tensor self, int dim, Tensor index, *, Tensor(a!) out) -> Tensor(a!)", "dispatch": "True", "default": "False"}
+    Tensor& index_select_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, at::Tensor& out)
+    {
+        GUARD;
+        Tensor self_c = self.contiguous(), index_c = index.contiguous(), out_c = out.contiguous();
+
+        dlprim::Tensor y1 = todp(out_c);
+        const dlprim::Shape s1 = y1.shape().split_and_merge_over_axis(dim);
+        y1.reshape(s1);
+        dlprim::Tensor y0(buffer_from_tensor(self_c), self_c.storage_offset(), s1, todp(self_c.dtype().toScalarType())),
+            x0(buffer_from_tensor(index_c), index_c.storage_offset(), { (size_t)index_c.size(0), 1 }, todp(index_c.dtype().toScalarType()));
+        const double dsize = self.size(dim) * s1[2];
+        dlprim::core::pointwise_operation_broadcast({ x0 }, { y0, y1 }, { dsize }, { dlprim::uint64_data },
+            "py1[get_direct_offset(index,limit,py1_offset)]=py0[index.s[0]*w0+x0*limit.s[2]+index.s[2]+py0_offset];return;",
+            getExecutionContext(self));
+        if (!out.is_contiguous())
+            out.copy_(out_c);
+        sync_if_needed(self.device());
+        return out;
+    }
+
+    // {"schema": "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor", "dispatch": "True", "default": "False"}
+    Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index)
+    {
+        GUARD;
+        auto sizs(self.sizes().vec());
+        sizs[dim] = index.size(0);
+        Tensor out = new_ocl_tensor(sizs, self.device(), self.dtype().toScalarType());
+        return index_select_out(self, dim, index, out);
+    }
+
+    // {"schema": "aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor(a!)", "dispatch": "True", "defualt": "False"}
+    Tensor& index_add_(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Scalar& alpha)
+    {
+        GUARD;
+        Tensor self_c = self.contiguous(), index_c = index.contiguous(), source_c = source.contiguous();
+
+        dlprim::Tensor x0 = todp(source_c);
+        const dlprim::Shape s0 = x0.shape().split_and_merge_over_axis(dim);
+        x0.reshape(s0);
+        dlprim::Tensor x1(buffer_from_tensor(index_c), index_c.storage_offset(), { (size_t)index_c.size(0), 1 }, todp(index_c.dtype().toScalarType())),
+            y0(buffer_from_tensor(self_c), self_c.storage_offset(), s0, todp(self_c.dtype().toScalarType()));
+        dlprim::core::pointwise_operation_broadcast({ x0, x1 }, { y0 },
+            { (double)self.size(dim) * s0[2], alpha.toDouble() },
+            { dlprim::uint64_data, dlprim::float_data },
+            // TODO: #include<atomic.h> and use atoimc_addf, or two-step method
+            STR(
+                float v = w1 * x0;
+                __global volatile int* ptr = (__global volatile int*)py0 + index.s[0] * w0 + x1 * limit.s[2] + index.s[2] + py0_offset;
+                union {float f; int i;} oldv) ","
+            STR(newv;
+                do {
+                    oldv.i = *ptr;
+                    newv.f = oldv.f + v;
+                } while (atomic_cmpxchg(ptr, oldv.i, newv.i) != oldv.i);
+                return;
+            ), getExecutionContext(self));
+        if (!self.is_contiguous())
+            self.copy_(self_c);
+        sync_if_needed(self.device());
+        return self;
+    }
+
+    // {"schema": "aten::index_add.out(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)", "dispatch": "True", "default": "False"}
+    Tensor& index_add(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const Scalar& alpha, Tensor& out)
+    {
+        GUARD;
+        out.copy_(self);
+        index_add_(out, dim, index, source, alpha);
         return out;
     }
 
@@ -1721,6 +1794,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
       m.impl("aten::isposinf.out",&ptdlprim::isposinf_out);
       m.impl("aten::isneginf.out",&ptdlprim::isneginf_out);
       m.impl("aten::where.self_out",&ptdlprim::where_out);
+      m.impl("aten::index_select.out", &ptdlprim::index_select_out);
+      m.impl("aten::index_select", &ptdlprim::index_select);
+      m.impl("aten::index_add_", &ptdlprim::index_add_);
+      m.impl("aten::index_add.out", &ptdlprim::index_add);
 
       m.impl("aten::bitwise_and.Tensor_out",&ptdlprim::bitwise_and_out);
       m.impl("aten::bitwise_or.Tensor_out",&ptdlprim::bitwise_or_out);
